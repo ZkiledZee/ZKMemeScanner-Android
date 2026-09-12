@@ -1,0 +1,82 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ZKMemeRadar-Android-Source.zip'
+      - '.github/workflows/build.yml'
+permissions:
+  contents: read
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack source ZIP
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile,stat
+          source=Path('ZKMemeRadar-Android-Source.zip')
+          if not source.is_file():
+              raise SystemExit('Upload ZKMemeRadar-Android-Source.zip to the repository root without extracting or renaming it.')
+          with zipfile.ZipFile(source) as z:
+              if sum(i.file_size for i in z.infolist())>50_000_000:
+                  raise SystemExit('Unexpected archive size')
+              for i in z.infolist():
+                  p=Path(i.filename)
+                  if p.is_absolute() or '..' in p.parts or stat.S_ISLNK(i.external_attr>>16):
+                      raise SystemExit('Unsafe archive entry')
+              if z.testzip(): raise SystemExit('ZIP is corrupt; upload it again')
+              z.extractall('android-source')
+          for name in ['settings.gradle','app/build.gradle','app/src/main/AndroidManifest.xml','signing/personal-test.jks']:
+              if not Path('android-source',name).is_file(): raise SystemExit('Missing '+name)
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Install Android build platform
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Verify signal engine and JavaScript
+        working-directory: android-source
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm test
+          node --check app/src/main/assets/app.js
+          node --check app/src/main/assets/bridge.js
+          python3 scripts/check_source.py
+      - name: Compile and lint Android application
+        working-directory: android-source
+        run: gradle --no-daemon :app:assembleRelease :app:lintRelease
+      - name: Validate and package APK
+        working-directory: android-source
+        run: |
+          mkdir -p output
+          cp app/build/outputs/apk/release/app-release.apk output/ZKMemeRadar.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose output/ZKMemeRadar.apk
+          python3 scripts/check_apk.py output/ZKMemeRadar.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZKMemeRadar-APK
+          path: android-source/output/ZKMemeRadar.apk
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-build-diagnostics
+          path: android-source/app/build/reports/
+          if-no-files-found: ignore
